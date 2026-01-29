@@ -1,0 +1,39 @@
+---
+
+### Utilisation
+
+#### A. Construire l'image
+```bash
+docker build -t mistral-cli .
+```
+
+#### B. Exécuter avec un prompt simple
+```bash
+docker run --rm --env-file .env mistral-cli "Explique moi le saut quantique en deux phrases"
+```
+
+#### C. Utiliser avec un PIPE (Le point clé)
+Pour que le pipe fonctionne avec Docker, il faut utiliser l'option `-i` (interactif) pour garder l'entrée standard ouverte.
+
+**Exemple 1 : Analyser un fichier de log ou de code**
+```bash
+cat main.py | docker run -i --rm --env-file .env mistral-cli "Explique ce code Python"
+```
+
+**Exemple 2 : Résumer le contenu d'une page web (si tu as curl)**
+```bash
+curl -s https://www.google.com | docker run -i --rm --env-file .env mistral-cli "Quels sont les mots clés principaux de ce HTML ?"
+```
+
+### Bonus : Créer un alias pour simplifier
+Pour ne pas taper toute la commande Docker à chaque fois, ajoute ceci à ton `.bashrc` ou `.zshrc` :
+
+```bash
+alias mistral='docker run -i --rm --env-file /chemin/vers/ton/.env mistral-cli'
+```
+
+Ensuite, tu pourras simplement faire :
+```bash
+cat data.txt | mistral "Fais un résumé"
+```
+

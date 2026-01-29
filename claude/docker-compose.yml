@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  ai-query-tool:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    restart: unless-stopped
+    dns:
+     - 8.8.8.8
+     - 1.1.1.1

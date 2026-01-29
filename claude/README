@@ -1,0 +1,37 @@
+# Querying the Groq API
+To query the Groq API, you can use the following `curl` command:
+
+```bash
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -d '{"provider": "groq", "prompt": "What is Docker?"}'
+```
+
+This command sends a POST request to the `/query` endpoint on `http://localhost:5000`, which is where the Groq API is running. The request includes a JSON payload with two key-value pairs:
+
+* `provider`: set to `"groq"`, which specifies the provider to use for the query
+* `prompt`: set to `"What is Docker?"`, which is the question or prompt to send to the API
+
+## Prerequisites
+To use the Groq API, you'll need to:
+
+1. **Get a free Groq API key**: Visit the [Groq Console](https://console.groq.com) to obtain a free API key.
+2. **Run the API on port 5000**: Ensure that the Groq API is running and listening on port 5000.
+
+## API Endpoints
+The Groq API supports the following endpoints:
+
+* **Health checks**: (not shown in the example command)
+* **Provider listing**: (not shown in the example command)
+* **AI queries**: The `/query` endpoint, which is used in the example command above.
+
+## Example Use Case
+To query the Groq API and get a response, simply run the example command above. You can modify the `prompt` value to ask different questions or send different prompts to the API.
+
+### Best Practices
+When using the Groq API, keep in mind the following best practices:
+
+* Always include a valid `provider` value in your API requests.
+* Use a clear and concise `prompt` value to get the most accurate and relevant responses.
+* Handle errors and exceptions properly, such as checking the API response status code and parsing any error messages.
+
