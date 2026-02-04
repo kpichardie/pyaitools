@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_server
+    volumes:
+      - ollama_data:/root/.ollama
+    security_opt:
+      - seccomp:unconfined
+    # Si tu as un GPU NVIDIA, décommente les lignes ci-dessous pour plus de vitesse
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: always
+
+  autonomous:
+    build: .
+    container_name: autonomous-orchestrator
+    depends_on:
+      - ollama
+    env_file: .env
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3
+    volumes:
+      - ./app:/app
+    restart: always
+
+volumes:
+  ollama_data:
