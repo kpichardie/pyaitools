@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 # Journal pour le rapport
 action_log = []
 
+# Agent version tracking
+AGENT_VERSION = "2.1.0"
+
+# Global state for pending self-update confirmations
+# Structure: {user_id: {'task_id': int, 'analysis': dict, 'timestamp': datetime, 'expires_at': datetime}}
+pending_confirmations = {}
 
 # --- ENUMS ET DATACLASSES ---
 class TaskStatus(Enum):
@@ -74,6 +80,7 @@ class TaskType(Enum):
     FILE_READ = "file_read"
     AI_ANALYSIS = "ai_analysis"
     PLAN = "plan"
+    SELF_UPDATE = "self_update"
 
 
 @dataclass
@@ -335,6 +342,10 @@ class TaskExecutor:
                 result = await self._ai_analysis(task, context)
             elif task.task_type == TaskType.PLAN:
                 result = await self._create_plan(task, context)
+            elif task.task_type == TaskType.SELF_UPDATE:
+                result = await self._execute_self_update(task, context)
+                # Self-update returns early and handles its own completion
+                return
             else:
                 result = "Type de tâche inconnu"
                 await context.bot.send_message(
@@ -504,12 +515,359 @@ Retourne UNIQUEMENT un JSON avec cette structure:
             logger.error(f"Erreur parsing plan: {e}")
             return f"Erreur création plan: {e}"
 
+    async def _execute_self_update(self, task: Task, context: ContextTypes.DEFAULT_TYPE) -> str:
+        """Execute self-improvement workflow with user confirmation"""
+        force_mode = task.parameters.get('force', False)
+        user_id = task.user_id
+        
+        try:
+            # Step 1: Collect data
+            await self._notify_progress(task, context, "📊 Collecting system data...")
+            code = await self._read_own_code()
+            logs = await self._read_recent_logs(lines=100)
+            metrics = await self._get_task_metrics()
+            
+            # Step 2: Query Gemini for analysis (NEVER use Ollama for self-update)
+            await self._notify_progress(task, context, "🤖 Analyzing with Gemini...")
+            analysis = await self._query_gemini_self_analysis(code, logs, metrics)
+            
+            if not analysis:
+                return "❌ Failed to get analysis from Gemini"
+            
+            # Step 3: Parse metrics
+            confidence = analysis.get('code_confidence', 0)
+            performance = analysis.get('performance', 0)
+            resilience = analysis.get('resilience', 0)
+            pertinence = analysis.get('pertinence', 0)
+            
+            # Step 4: Display results
+            metrics_msg = f"""📊 Self-Analysis Results:
+• Code Confidence: {confidence}%
+• Performance: {performance}%
+• Resilience: {resilience}%
+• Pertinence: {pertinence}%
+
+Proposed changes: {len(analysis.get('changes', []))} files
+
+Summary: {analysis.get('summary', 'No summary provided')}"""
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=metrics_msg,
+                parse_mode='Markdown'
+            )
+            
+            # Step 5: Decision
+            all_good = all(m >= 50 for m in [confidence, performance, resilience, pertinence])
+            
+            if force_mode:
+                logger.warning(f"FORCE MODE: User {user_id} triggered force self-update")
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⚠️ FORCE MODE: Applying changes without confirmation...",
+                    parse_mode='Markdown'
+                )
+                result = await self._apply_self_update_changes(analysis, task, context)
+                return f"Changes applied (force mode): {result}"
+            
+            if all_good:
+                # Good metrics - ask for confirmation
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ All metrics ≥ 50%. Apply changes?\nReply: YES or NO\nOr SHOWDIFF to see detailed changes",
+                    parse_mode='Markdown'
+                )
+            else:
+                # Low metrics - require explicit approval
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"⚠️ Low metrics detected (some < 50%). Review recommended.\nReply SHOWDIFF to see changes or YES to apply anyway.\nOr NO to cancel.",
+                    parse_mode='Markdown'
+                )
+            
+            # Store confirmation state
+            pending_confirmations[user_id] = {
+                'task_id': task.id,
+                'analysis': analysis,
+                'timestamp': datetime.now(),
+                'expires_at': datetime.now() + timedelta(minutes=30)
+            }
+            
+            return "Awaiting user confirmation (30 min timeout)"
+            
+        except Exception as e:
+            logger.error(f"Self-update execution error: {e}")
+            return f"❌ Self-update failed: {e}"
+    
+    async def _notify_progress(self, task: Task, context: ContextTypes.DEFAULT_TYPE, message: str):
+        """Send progress notification"""
+        await context.bot.send_message(
+            chat_id=task.user_id,
+            text=f"🔄 [Task #{task.id}] {message}",
+            parse_mode='Markdown'
+        )
+    
+    async def _read_own_code(self) -> str:
+        """Read the agent's own source code"""
+        try:
+            with open('/app/autonomous_orchestrator.py', 'r') as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f"Failed to read own code: {e}")
+            return ""
+    
+    async def _read_recent_logs(self, lines: int = 100) -> str:
+        """Read recent log entries"""
+        try:
+            with open(LOG_FILE, 'r') as f:
+                log_lines = f.readlines()
+                return "".join(log_lines[-lines:])
+        except Exception as e:
+            logger.error(f"Failed to read logs: {e}")
+            return ""
+    
+    async def _get_task_metrics(self) -> Dict[str, Any]:
+        """Get task execution metrics from database"""
+        try:
+            completed = len(self.db.get_tasks_by_status(TaskStatus.COMPLETED))
+            failed = len(self.db.get_tasks_by_status(TaskStatus.FAILED))
+            pending = len(self.db.get_tasks_by_status(TaskStatus.PENDING))
+            retrying = len(self.db.get_tasks_by_status(TaskStatus.RETRYING))
+            
+            total = completed + failed + pending + retrying
+            success_rate = (completed / total * 100) if total > 0 else 0
+            
+            return {
+                'total_tasks': total,
+                'completed': completed,
+                'failed': failed,
+                'pending': pending,
+                'retrying': retrying,
+                'success_rate': round(success_rate, 2),
+                'agent_version': AGENT_VERSION
+            }
+        except Exception as e:
+            logger.error(f"Failed to get task metrics: {e}")
+            return {'error': str(e)}
+    
+    async def _query_gemini_self_analysis(self, code: str, logs: str, metrics: Dict) -> Optional[Dict]:
+        """Query Gemini for self-analysis (NEVER use Ollama for this)"""
+        prompt = f"""Analyze the following autonomous agent code and provide improvement suggestions.
+
+Current Code:
+```python
+{code[:8000]}
+```
+
+Recent Logs (last 100 lines):
+```
+{logs}
+```
+
+Task Metrics:
+- Total Tasks: {metrics.get('total_tasks', 0)}
+- Success Rate: {metrics.get('success_rate', 0)}%
+- Failed: {metrics.get('failed', 0)}
+- Current Version: {metrics.get('agent_version', 'unknown')}
+
+Evaluate and provide:
+1. code_confidence: 0-100 (how confident are you in the code quality)
+2. performance: 0-100 (how well does it perform)
+3. resilience: 0-100 (how resilient is the error handling)
+4. pertinence: 0-100 (how pertinent are the features)
+5. summary: Brief description of the main improvement
+6. changes: List of specific changes to make, each with:
+   - file: path to file
+   - description: what to change
+   - new_content: complete new content for the file
+
+Return ONLY a valid JSON object with this exact structure:
+{{
+    "code_confidence": 75,
+    "performance": 80,
+    "resilience": 65,
+    "pertinence": 70,
+    "summary": "Brief summary of improvements",
+    "changes": [
+        {{
+            "file": "/app/autonomous_orchestrator.py",
+            "description": "Description of change",
+            "new_content": "complete file content here"
+        }}
+    ]
+}}"""
+        
+        try:
+            # Only use Gemini, never fallback to Ollama for self-update
+            response = client.models.generate_content(model=MODEL_ID, contents=prompt)
+            if not response or not response.text:
+                return None
+            
+            # Parse JSON from response
+            text = response.text.strip()
+            # Handle markdown code blocks
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+            
+            return json.loads(text)
+        except Exception as e:
+            logger.error(f"Failed to query Gemini for self-analysis: {e}")
+            return None
+    
+    async def _apply_self_update_changes(self, analysis: Dict, task: Task, context: ContextTypes.DEFAULT_TYPE) -> str:
+        """Apply the self-update changes"""
+        changes = analysis.get('changes', [])
+        backup_dir = None
+        
+        if not changes:
+            return "No changes to apply"
+        
+        try:
+            # Step 1: Create backup
+            backup_dir = f"/app/backups/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            await self._notify_progress(task, context, "💾 Creating backup...")
+            subprocess.run(['cp', '/app/autonomous_orchestrator.py', f"{backup_dir}/autonomous_orchestrator.py"], check=True)
+            
+            # Step 2: Apply changes
+            await self._notify_progress(task, context, "✏️ Applying changes...")
+            for change in changes:
+                file_path = change.get('file')
+                new_content = change.get('new_content')
+                
+                if file_path and new_content:
+                    with open(file_path, 'w') as f:
+                        f.write(new_content)
+                    logger.info(f"Updated file: {file_path}")
+            
+            # Step 3: Git commit
+            await self._notify_progress(task, context, "📦 Creating git commit...")
+            
+            # Check git status
+            status_result = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True, cwd='/app')
+            
+            if status_result.stdout.strip():
+                # There are changes to commit
+                confidence = analysis.get('code_confidence', 0)
+                performance = analysis.get('performance', 0)
+                resilience = analysis.get('resilience', 0)
+                pertinence = analysis.get('pertinence', 0)
+                summary = analysis.get('summary', 'Self-update')
+                
+                subprocess.run(['git', 'add', '.'], check=True, cwd='/app')
+                commit_msg = f"Self-update: {summary}\n\nMetrics: C:{confidence}% P:{performance}% R:{resilience}% Pe:{pertinence}%\nVersion: {AGENT_VERSION}"
+                subprocess.run(['git', 'commit', '-m', commit_msg], check=True, cwd='/app')
+                
+                # Try to push if remote exists
+                try:
+                    subprocess.run(['git', 'push'], check=True, cwd='/app', capture_output=True)
+                except:
+                    logger.warning("Failed to push to remote, but commit was successful")
+            
+            # Step 4: Create changelog entry
+            await self._notify_progress(task, context, "📝 Updating changelog...")
+            self._update_changelog(analysis)
+            
+            # Step 5: Notify restart
+            await context.bot.send_message(
+                chat_id=task.user_id,
+                text="✅ Changes applied and committed.\n🔄 Restarting agent in 5 seconds...",
+                parse_mode='Markdown'
+            )
+            
+            # Step 6: Schedule restart
+            await asyncio.sleep(5)
+            await self._restart_container()
+            
+            return "Changes applied successfully. Agent restarting..."
+            
+        except Exception as e:
+            logger.error(f"Failed to apply self-update changes: {e}")
+            # Restore from backup
+            if backup_dir:
+                try:
+                    subprocess.run(['cp', f"{backup_dir}/autonomous_orchestrator.py", '/app/autonomous_orchestrator.py'], check=True)
+                    logger.info("Restored from backup after failed update")
+                except:
+                    pass
+            raise e
+    
+    def _update_changelog(self, analysis: Dict):
+        """Update changelog with self-update information"""
+        try:
+            changelog_path = '/app/CHANGELOG.md'
+            confidence = analysis.get('code_confidence', 0)
+            performance = analysis.get('performance', 0)
+            resilience = analysis.get('resilience', 0)
+            pertinence = analysis.get('pertinence', 0)
+            summary = analysis.get('summary', 'Self-update')
+            
+            entry = f"""## {AGENT_VERSION} ({datetime.now().strftime('%Y-%m-%d')})
+- Self-improvement update
+- Metrics: Confidence:{confidence}%, Performance:{performance}%, Resilience:{resilience}%, Pertinence:{pertinence}%
+- Changes: {summary}
+- Initiated by: Agent self-update system
+
+"""
+            
+            if os.path.exists(changelog_path):
+                with open(changelog_path, 'r') as f:
+                    existing = f.read()
+                with open(changelog_path, 'w') as f:
+                    f.write(entry + existing)
+            else:
+                with open(changelog_path, 'w') as f:
+                    f.write("# Changelog\n\n" + entry)
+                    
+        except Exception as e:
+            logger.error(f"Failed to update changelog: {e}")
+    
+    async def _restart_container(self):
+        """Trigger container restart"""
+        try:
+            # Method 1: Check if running in Docker and restart via docker command
+            if os.path.exists('/.dockerenv'):
+                # Get container ID
+                with open('/proc/self/cgroup', 'r') as f:
+                    content = f.read()
+                    container_id = None
+                    for line in content.split('\n'):
+                        if 'docker' in line:
+                            parts = line.split('/')
+                            if len(parts) > 2:
+                                container_id = parts[-1][:12]
+                                break
+                
+                if container_id:
+                    logger.info(f"Restarting container: {container_id}")
+                    # This requires docker socket access
+                    subprocess.run(['docker', 'restart', container_id], check=False)
+                else:
+                    # Fallback: exit and let orchestrator restart
+                    logger.info("Container ID not found, exiting for restart")
+                    sys.exit(0)
+            else:
+                # Not in Docker, just exit
+                logger.info("Not in Docker container, exiting for restart")
+                sys.exit(0)
+        except Exception as e:
+            logger.error(f"Failed to restart container: {e}")
+            # Fallback: exit anyway
+            sys.exit(0)
+
 
 # --- TELEGRAM HANDLERS ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère les messages Telegram (votre logique originale améliorée)"""
     if str(update.effective_user.id) != str(AUTHORIZED_USER_ID):
         logger.warning(f"Accès non autorisé: {update.effective_user.id}")
+        return
+
+    # Check if this is a confirmation response first
+    if await handle_confirmation_response(update, context):
         return
 
     user_text = update.message.text
@@ -796,6 +1154,136 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erreur: {e}")
 
 
+async def cmd_selfupdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trigger manual self-improvement analysis via Telegram"""
+    if str(update.effective_user.id) != str(AUTHORIZED_USER_ID):
+        return
+    
+    args = context.args if context.args else []
+    force_mode = 'force' in args
+    
+    # Check if there's already a pending confirmation for this user
+    user_id = update.effective_user.id
+    if user_id in pending_confirmations:
+        await update.message.reply_text(
+            "⏳ You already have a pending self-update confirmation.\n"
+            "Reply YES, NO, or SHOWDIFF to the previous request first.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Start self-update task
+    db = context.bot_data['db']
+    executor = context.bot_data['executor']
+    
+    task = Task(
+        id=None,
+        user_id=user_id,
+        description="Manual self-update triggered" + (" (FORCE)" if force_mode else ""),
+        task_type=TaskType.SELF_UPDATE,
+        parameters={'force': force_mode, 'initiated_by': 'telegram'},
+        status=TaskStatus.PENDING,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        retry_count=0,
+        max_retries=1,  # Self-update only retries once
+        parent_task_id=None,
+        error_message=None,
+        result=None,
+        scheduled_at=None
+    )
+    
+    task.id = db.create_task(task)
+    
+    await update.message.reply_text(
+        f"🔍 Self-update task #{task.id} created.{' Force mode enabled.' if force_mode else ''}\n"
+        f"Starting analysis... This may take a minute.",
+        parse_mode='Markdown'
+    )
+    
+    # Execute immediately
+    await executor.execute_task(task, context)
+
+
+async def handle_confirmation_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle user responses to self-update confirmations. Returns True if handled."""
+    user_id = update.effective_user.id
+    
+    # Check if user is authorized and has pending confirmation
+    if str(user_id) != str(AUTHORIZED_USER_ID):
+        return False
+    
+    if user_id not in pending_confirmations:
+        return False
+    
+    user_text = update.message.text.upper().strip()
+    confirmation = pending_confirmations[user_id]
+    
+    # Check if confirmation has expired
+    if datetime.now() > confirmation['expires_at']:
+        del pending_confirmations[user_id]
+        await update.message.reply_text(
+            "⌛ Confirmation expired. Run /selfupdate again if you want to retry.",
+            parse_mode='Markdown'
+        )
+        return True
+    
+    db = context.bot_data['db']
+    executor = context.bot_data['executor']
+    task = db.get_task(confirmation['task_id'])
+    
+    if not task:
+        del pending_confirmations[user_id]
+        await update.message.reply_text("❌ Task not found. Please try again.")
+        return True
+    
+    if user_text == 'YES':
+        # Apply changes
+        await update.message.reply_text("✅ Applying changes... This will take a moment.")
+        
+        try:
+            analysis = confirmation['analysis']
+            result = await executor._apply_self_update_changes(analysis, task, context)
+            del pending_confirmations[user_id]
+        except Exception as e:
+            logger.error(f"Failed to apply self-update: {e}")
+            await update.message.reply_text(f"❌ Failed to apply changes: {e}")
+            del pending_confirmations[user_id]
+        
+        return True
+        
+    elif user_text == 'NO':
+        await update.message.reply_text("❌ Self-update cancelled. No changes were made.")
+        del pending_confirmations[user_id]
+        return True
+        
+    elif user_text == 'SHOWDIFF':
+        # Show detailed diff
+        analysis = confirmation['analysis']
+        changes = analysis.get('changes', [])
+        
+        if not changes:
+            await update.message.reply_text("No changes to display.")
+            return True
+        
+        diff_text = "📋 Proposed changes:\n\n"
+        for i, change in enumerate(changes[:5], 1):  # Show max 5 changes
+            file_path = change.get('file', 'unknown')
+            description = change.get('description', 'No description')
+            diff_text += f"{i}. **{file_path}**\n   {description}\n\n"
+        
+        if len(changes) > 5:
+            diff_text += f"... and {len(changes) - 5} more changes\n"
+        
+        diff_text += "\nReply YES to apply or NO to cancel."
+        
+        await update.message.reply_text(diff_text, parse_mode='Markdown')
+        return True
+    
+    # Not a confirmation command, let it pass through
+    return False
+
+
 # --- JOBS DE FOND ---
 async def process_pending_tasks(context: ContextTypes.DEFAULT_TYPE):
     """Traite les tâches en attente"""
@@ -833,26 +1321,98 @@ async def hourly_report(context: ContextTypes.DEFAULT_TYPE):
     logs_summary = "\n".join(action_log[-20:])
     try:
         if FORCED_AI_REPORT:
-            res = safe_generate(contents=f"Résume ces actions en 3 lignes max: {logs_summary}" , context=context)
+            res = await safe_generate(f"Résume ces actions en 3 lignes max: {logs_summary}", context)
+            report_text = res if res else "No report available"
         else: 
             async with httpx.AsyncClient(timeout=120.0) as http_client:
                payload = {
                    "model": OLLAMA_MODEL,
-                   "prompt": prompt,
+                   "prompt": f"Résume ces actions en 3 lignes max: {logs_summary}",
                    "stream": False
                }
                res = await http_client.post(f"{OLLAMA_HOST}/api/generate", json=payload)
                res.raise_for_status()
                data = res.json()
+               report_text = data.get('response', 'No report available')
         await context.bot.send_message(
             chat_id=AUTHORIZED_USER_ID,
-            text=f"⏰ **Rapport Horaire**\n{res.text}",
+            text=f"⏰ **Rapport Horaire**\n{report_text}",
             parse_mode='Markdown'
         )
     except Exception as e:
         logger.error(f"Erreur rapport: {e}")
 
     action_log.clear()
+
+
+async def cleanup_expired_confirmations(context: ContextTypes.DEFAULT_TYPE):
+    """Clean up expired self-update confirmations"""
+    global pending_confirmations
+    now = datetime.now()
+    expired_users = []
+    
+    for user_id, confirmation in pending_confirmations.items():
+        if now > confirmation['expires_at']:
+            expired_users.append(user_id)
+    
+    for user_id in expired_users:
+        del pending_confirmations[user_id]
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⌛ Self-update confirmation expired. Run /selfupdate again if you want to retry.",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id} of expired confirmation: {e}")
+    
+    if expired_users:
+        logger.info(f"Cleaned up {len(expired_users)} expired confirmations")
+
+
+async def daily_self_analysis(context: ContextTypes.DEFAULT_TYPE):
+    """Trigger automatic daily self-improvement analysis"""
+    try:
+        logger.info("Starting daily self-analysis...")
+        
+        db = context.bot_data['db']
+        executor = context.bot_data['executor']
+        
+        # Check if there's already a pending confirmation
+        if pending_confirmations:
+            logger.info("Skipping daily self-analysis: pending confirmation exists")
+            return
+        
+        # Create self-update task
+        if not AUTHORIZED_USER_ID:
+            logger.error("AUTHORIZED_USER_ID not set, skipping daily self-analysis")
+            return
+            
+        task = Task(
+            id=None,
+            user_id=int(AUTHORIZED_USER_ID),
+            description="Daily automatic self-analysis",
+            task_type=TaskType.SELF_UPDATE,
+            parameters={'force': False, 'initiated_by': 'daily_job'},
+            status=TaskStatus.PENDING,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            retry_count=0,
+            max_retries=1,
+            parent_task_id=None,
+            error_message=None,
+            result=None,
+            scheduled_at=None
+        )
+        
+        task.id = db.create_task(task)
+        logger.info(f"Created daily self-update task #{task.id}")
+        
+        # Execute the task
+        await executor.execute_task(task, context)
+        
+    except Exception as e:
+        logger.error(f"Error in daily self-analysis: {e}")
 
 
 # --- VOTRE LOGIQUE (handle_message, safe_generate, etc.) ---
@@ -886,17 +1446,20 @@ async def main():
 
     # Handlers
     app.add_handler(CommandHandler("ping", lambda u, c: u.message.reply_text("PONG 🏓")))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.add_handler(CommandHandler("selfupdate", cmd_selfupdate))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_error_handler(error_handler)
 
-    # Configuration des tâches de fond
+    # Jobs
     if app.job_queue:
         app.job_queue.run_repeating(process_pending_tasks, interval=60, first=10)
         app.job_queue.run_repeating(check_retrying_tasks, interval=60, first=20)
+        app.job_queue.run_repeating(cleanup_expired_confirmations, interval=60, first=30)
         app.job_queue.run_repeating(hourly_report, interval=10800, first=60)
+        app.job_queue.run_repeating(daily_self_analysis, interval=86400, first=3600)  # Daily at 1 hour after start
 
     # Démarrage propre
     logger.info("✅ Agent en ligne. En attente de messages...")
