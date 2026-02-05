@@ -28,6 +28,9 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, Comma
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+KIMI_API_KEY = os.getenv('KIMI_API_KEY')
+KIMI_BASE_URL = os.getenv('KIMI_BASE_URL', 'https://api.moonshot.cn/v1')
+KIMI_MODEL = os.getenv('KIMI_MODEL', 'kimi-k2.5')
 AUTHORIZED_USER_ID = os.getenv('AUTHORIZED_USER_ID')
 DB_FILE = os.getenv('DB_FILE', '/app/tasks.db')
 LOG_FILE = os.getenv('LOG_FILE', '/app/autonomous.log')
@@ -39,8 +42,8 @@ OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3')
 FORCED_AI_REPORT = os.getenv('FORCED_AI_REPORT', False)
 
-# Init Gemini
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Init AI clients
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # --- CONFIGURATION LOGGING ---
 logging.basicConfig(
@@ -63,6 +66,488 @@ AGENT_VERSION = "2.1.0"
 # Global state for pending self-update confirmations
 # Structure: {user_id: {'task_id': int, 'analysis': dict, 'timestamp': datetime, 'expires_at': datetime}}
 pending_confirmations = {}
+
+# Startup verification state
+startup_verification_pending = None  # Will store verification data after update
+
+
+# --- STARTUP VERIFICATION FUNCTIONS ---
+def get_current_git_commit() -> str:
+    """Get the current git commit hash"""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True,
+            text=True,
+            cwd='/app',
+            timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception as e:
+        logger.warning(f"Failed to get git commit: {e}")
+    return "unknown"
+
+
+def get_last_stored_commit() -> str:
+    """Get the last stored commit hash from file"""
+    try:
+        commit_file = '/app/.last_commit'
+        if os.path.exists(commit_file):
+            with open(commit_file, 'r') as f:
+                return f.read().strip()
+    except Exception as e:
+        logger.warning(f"Failed to read last commit: {e}")
+    return None
+
+
+def store_current_commit(commit_hash: str):
+    """Store the current commit hash to file"""
+    try:
+        commit_file = '/app/.last_commit'
+        with open(commit_file, 'w') as f:
+            f.write(commit_hash)
+        logger.info(f"Stored current commit: {commit_hash[:8]}")
+    except Exception as e:
+        logger.error(f"Failed to store commit: {e}")
+
+
+def get_commit_info(commit_hash: str) -> dict:
+    """Get information about a commit"""
+    try:
+        result = subprocess.run(
+            ['git', 'log', '-1', '--format=%H|%an|%ae|%s|%ci', commit_hash],
+            capture_output=True,
+            text=True,
+            cwd='/app',
+            timeout=5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split('|', 4)
+            if len(parts) >= 5:
+                return {
+                    'hash': parts[0],
+                    'author': parts[1],
+                    'email': parts[2],
+                    'subject': parts[3],
+                    'date': parts[4]
+                }
+    except Exception as e:
+        logger.warning(f"Failed to get commit info: {e}")
+    return None
+
+
+def check_logs_since_update() -> dict:
+    """Check logs for issues since the last update"""
+    issues = {
+        'errors': [],
+        'warnings': [],
+        'tracebacks': [],
+        'total_errors': 0,
+        'total_warnings': 0
+    }
+    
+    try:
+        if not os.path.exists(LOG_FILE):
+            return issues
+            
+        with open(LOG_FILE, 'r') as f:
+            lines = f.readlines()
+        
+        # Look at the last 500 lines for recent issues
+        recent_lines = lines[-500:] if len(lines) > 500 else lines
+        
+        in_traceback = False
+        current_traceback = []
+        
+        for line in recent_lines:
+            line_lower = line.lower()
+            
+            # Detect errors
+            if 'error' in line_lower or 'exception' in line_lower or 'critical' in line_lower:
+                if 'traceback' in line_lower:
+                    in_traceback = True
+                    current_traceback = [line]
+                else:
+                    issues['errors'].append(line.strip())
+                    issues['total_errors'] += 1
+            
+            # Detect warnings
+            elif 'warning' in line_lower:
+                issues['warnings'].append(line.strip())
+                issues['total_warnings'] += 1
+            
+            # Capture traceback
+            elif in_traceback:
+                current_traceback.append(line)
+                if line.strip() and not line.startswith(' ') and not line.startswith('\t'):
+                    # End of traceback
+                    issues['tracebacks'].append(''.join(current_traceback))
+                    current_traceback = []
+                    in_traceback = False
+        
+        # Don't forget the last traceback if file ended during one
+        if current_traceback:
+            issues['tracebacks'].append(''.join(current_traceback))
+            
+    except Exception as e:
+        logger.error(f"Error checking logs: {e}")
+    
+    return issues
+
+
+async def analyze_startup_issues(context: ContextTypes.DEFAULT_TYPE, commit_info: dict, issues: dict) -> dict:
+    """Query AI to analyze startup issues after an update"""
+    
+    # Prepare issue summary
+    error_samples = issues['errors'][:10]
+    warning_samples = issues['warnings'][:5]
+    traceback_samples = issues['tracebacks'][:2]
+    
+    prompt = f"""Analyze the following startup issues after a self-update and provide recommendations.
+
+Last Update Information:
+- Commit: {commit_info['hash'][:8]}
+- Author: {commit_info['author']}
+- Date: {commit_info['date']}
+- Subject: {commit_info['subject']}
+
+Issues Detected Since Update:
+- Total Errors: {issues['total_errors']}
+- Total Warnings: {issues['total_warnings']}
+
+Sample Errors:
+{chr(10).join(error_samples) if error_samples else 'None'}
+
+Sample Warnings:
+{chr(10).join(warning_samples) if warning_samples else 'None'}
+
+Sample Tracebacks:
+{chr(10).join(traceback_samples) if traceback_samples else 'None'}
+
+Analyze these issues and provide:
+1. severity: "critical" | "high" | "medium" | "low"
+2. summary: Brief description of the main problem
+3. likely_cause: What probably caused these issues
+4. recommendation: "revert" | "self_update" | "monitor"
+5. confidence: 0-100 (how confident are you in this assessment)
+6. explanation: Why you recommend this action
+
+Return ONLY a valid JSON object with this exact structure:
+{{
+    "severity": "high",
+    "summary": "Brief summary of the issue",
+    "likely_cause": "Description of likely cause",
+    "recommendation": "revert",
+    "confidence": 85,
+    "explanation": "Detailed explanation of the recommendation"
+}}"""
+
+    try:
+        # Try Gemini first, then Kimi
+        response_text = None
+        
+        if client and GEMINI_API_KEY:
+            try:
+                response = client.models.generate_content(model=MODEL_ID, contents=prompt)
+                if response and response.text:
+                    response_text = response.text
+                    logger.info("Startup analysis: Using Gemini")
+            except Exception as e:
+                logger.warning(f"Gemini unavailable for startup analysis: {e}")
+        
+        if not response_text and KIMI_API_KEY:
+            try:
+                response_text = await query_kimi(prompt)
+                if response_text:
+                    logger.info("Startup analysis: Using Kimi K2.5")
+            except Exception as e:
+                logger.warning(f"Kimi unavailable for startup analysis: {e}")
+        
+        if not response_text:
+            return None
+        
+        # Parse JSON
+        text = response_text.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+        
+        return json.loads(text)
+        
+    except Exception as e:
+        logger.error(f"Failed to analyze startup issues: {e}")
+        return None
+
+
+async def perform_startup_verification(context: ContextTypes.DEFAULT_TYPE):
+    """Check if this is first start after update and verify for issues"""
+    global startup_verification_pending
+    
+    try:
+        current_commit = get_current_git_commit()
+        last_commit = get_last_stored_commit()
+        
+        # If no previous commit stored, just store current and continue
+        if not last_commit:
+            logger.info("No previous commit stored. First run or commit tracking disabled.")
+            store_current_commit(current_commit)
+            return
+        
+        # If commits are the same, no update since last start
+        if current_commit == last_commit:
+            logger.info(f"No update detected. Running commit: {current_commit[:8]}")
+            return
+        
+        # This is the first start after an update!
+        logger.info(f"Update detected! Last: {last_commit[:8]} → Current: {current_commit[:8]}")
+        
+        # Get commit info
+        commit_info = get_commit_info(current_commit)
+        if not commit_info:
+            commit_info = {
+                'hash': current_commit,
+                'author': 'Unknown',
+                'email': '',
+                'subject': 'Unknown',
+                'date': 'Unknown'
+            }
+        
+        # Check logs for issues
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text=f"🔄 **Startup Verification**\n\n"
+                 f"Update detected!\n"
+                 f"Previous: `{last_commit[:8]}`\n"
+                 f"Current: `{current_commit[:8]}`\n\n"
+                 f"Analyzing logs for issues...",
+            parse_mode='Markdown'
+        )
+        
+        issues = check_logs_since_update()
+        
+        # If no issues found, just notify and store
+        if issues['total_errors'] == 0 and issues['total_warnings'] < 5:
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=f"✅ **Startup Check Passed**\n\n"
+                     f"Update: `{current_commit[:8]}`\n"
+                     f"Subject: {commit_info['subject']}\n"
+                     f"No significant issues detected.\n\n"
+                     f"Agent is running normally.",
+                parse_mode='Markdown'
+            )
+            store_current_commit(current_commit)
+            return
+        
+        # Issues found - analyze with AI
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text=f"⚠️ **Issues Detected**\n\n"
+                 f"Errors: {issues['total_errors']}\n"
+                 f"Warnings: {issues['total_warnings']}\n\n"
+                 f"Analyzing with AI...",
+            parse_mode='Markdown'
+        )
+        
+        analysis = await analyze_startup_issues(context, commit_info, issues)
+        
+        if not analysis:
+            # AI analysis failed, provide basic info
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=f"⚠️ **Update Verification Required**\n\n"
+                     f"Commit: `{current_commit[:8]}`\n"
+                     f"Subject: {commit_info['subject']}\n\n"
+                     f"Issues detected:\n"
+                     f"- {issues['total_errors']} errors\n"
+                     f"- {issues['total_warnings']} warnings\n\n"
+                     f"AI analysis unavailable.\n\n"
+                     f"Options:\n"
+                     f"/revert - Revert to previous commit\n"
+                     f"/selfupdate - Trigger self-update to fix issues\n"
+                     f"/ignore - Continue and mark as verified",
+                parse_mode='Markdown'
+            )
+            
+            # Store verification state
+            startup_verification_pending = {
+                'last_commit': last_commit,
+                'current_commit': current_commit,
+                'commit_info': commit_info,
+                'issues': issues,
+                'timestamp': datetime.now()
+            }
+            return
+        
+        # AI analysis successful
+        severity_emoji = {
+            'critical': '🔴',
+            'high': '🟠',
+            'medium': '🟡',
+            'low': '🟢'
+        }
+        
+        emoji = severity_emoji.get(analysis.get('severity', 'medium'), '🟡')
+        recommendation = analysis.get('recommendation', 'monitor')
+        confidence = analysis.get('confidence', 0)
+        
+        # Store verification state
+        startup_verification_pending = {
+            'last_commit': last_commit,
+            'current_commit': current_commit,
+            'commit_info': commit_info,
+            'issues': issues,
+            'analysis': analysis,
+            'timestamp': datetime.now()
+        }
+        
+        # Build recommendation message
+        if recommendation == 'revert':
+            action_text = f"{emoji} **CRITICAL: REVERT RECOMMENDED**\n\n"
+            options_text = "Options:\n/revert - Revert to previous commit\n/ignore - Continue anyway (not recommended)"
+        elif recommendation == 'self_update':
+            action_text = f"{emoji} **Issues Detected: Self-Update Recommended**\n\n"
+            options_text = "Options:\n/selfupdate - Trigger self-update to fix\n/ignore - Continue and monitor"
+        else:
+            action_text = f"{emoji} **Minor Issues: Monitor Recommended**\n\n"
+            options_text = "Options:\n/ignore - Mark as verified and continue\n/selfupdate - Run self-update anyway"
+        
+        message = (
+            f"{action_text}"
+            f"Commit: `{current_commit[:8]}`\n"
+            f"Subject: {commit_info['subject']}\n"
+            f"Severity: {analysis.get('severity', 'unknown').upper()}\n"
+            f"Confidence: {confidence}%\n\n"
+            f"**Summary:**\n{analysis.get('summary', 'No summary')}\n\n"
+            f"**Likely Cause:**\n{analysis.get('likely_cause', 'Unknown')}\n\n"
+            f"**Explanation:**\n{analysis.get('explanation', 'No explanation')}\n\n"
+            f"**Issues:** {issues['total_errors']} errors, {issues['total_warnings']} warnings\n\n"
+            f"{options_text}"
+        )
+        
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text=message,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error during startup verification: {e}")
+        # Don't block startup, just log the error
+        store_current_commit(get_current_git_commit())
+
+
+async def cmd_revert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Revert to the previous commit after a failed update"""
+    global startup_verification_pending
+    
+    if str(update.effective_user.id) != str(AUTHORIZED_USER_ID):
+        return
+    
+    if not startup_verification_pending:
+        await update.message.reply_text(
+            "❌ No pending verification found. Cannot revert.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    last_commit = startup_verification_pending['last_commit']
+    current_commit = startup_verification_pending['current_commit']
+    
+    try:
+        await update.message.reply_text(
+            f"🔄 **Reverting Update**\n\n"
+            f"From: `{current_commit[:8]}`\n"
+            f"To: `{last_commit[:8]}`\n\n"
+            f"Creating backup and reverting...",
+            parse_mode='Markdown'
+        )
+        
+        # Create backup of current state
+        backup_dir = f"/app/backups/revert_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        subprocess.run(
+            ['cp', '/app/autonomous_orchestrator.py', f"{backup_dir}/autonomous_orchestrator.py"],
+            check=True
+        )
+        
+        # Revert to last commit
+        result = subprocess.run(
+            ['git', 'reset', '--hard', last_commit],
+            capture_output=True,
+            text=True,
+            cwd='/app',
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            await update.message.reply_text(
+                f"✅ **Revert Successful**\n\n"
+                f"Reverted to: `{last_commit[:8]}`\n\n"
+                f"🔄 Restarting agent in 5 seconds...",
+                parse_mode='Markdown'
+            )
+            
+            # Clear verification state
+            startup_verification_pending = None
+            
+            # Store the reverted commit
+            store_current_commit(last_commit)
+            
+            # Restart
+            await asyncio.sleep(5)
+            # Get executor from context and restart
+            executor = context.bot_data.get('executor')
+            if executor:
+                await executor._restart_container()
+            else:
+                # Fallback: just exit
+                sys.exit(0)
+        else:
+            await update.message.reply_text(
+                f"❌ **Revert Failed**\n\n"
+                f"Error: `{result.stderr}`",
+                parse_mode='Markdown'
+            )
+            
+    except Exception as e:
+        logger.error(f"Revert failed: {e}")
+        await update.message.reply_text(
+            f"❌ **Revert Failed**\n\n"
+            f"Error: `{str(e)}`",
+            parse_mode='Markdown'
+        )
+
+
+async def cmd_ignore_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ignore startup verification issues and continue"""
+    global startup_verification_pending
+    
+    if str(update.effective_user.id) != str(AUTHORIZED_USER_ID):
+        return
+    
+    if not startup_verification_pending:
+        await update.message.reply_text(
+            "ℹ️ No pending verification to ignore.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    current_commit = startup_verification_pending['current_commit']
+    
+    # Store the commit to mark as verified
+    store_current_commit(current_commit)
+    startup_verification_pending = None
+    
+    await update.message.reply_text(
+        f"✅ **Verification Ignored**\n\n"
+        f"Current commit `{current_commit[:8]}` marked as verified.\n"
+        f"Agent will continue running normally.",
+        parse_mode='Markdown'
+    )
 
 # --- ENUMS ET DATACLASSES ---
 class TaskStatus(Enum):
@@ -273,44 +758,89 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 # --- GESTION DES QUOTAS AI (votre code original) ---
-async def safe_generate(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> Optional[Any]:
-    """Génère du contenu avec gestion du quota 429"""
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            return client.models.generate_content(model=MODEL_ID, contents=prompt).text
-        except Exception as e:
-            logger.warning(f"⚠️ Gemini indisponible ({e}). Bascule sur Ollama local...")
+async def query_kimi(prompt: str) -> Optional[str]:
+    """Query Kimi K2.5 API"""
+    if not KIMI_API_KEY:
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as http_client:
+            headers = {
+                "Authorization": f"Bearer {KIMI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": KIMI_MODEL,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.7
+            }
+            res = await http_client.post(
+                f"{KIMI_BASE_URL}/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            res.raise_for_status()
+            data = res.json()
+            return data.get('choices', [{}])[0].get('message', {}).get('content')
+    except Exception as e:
+        logger.warning(f"⚠️ Kimi API error: {e}")
+        return None
 
-        # 2. Fallback sur Ollama (Local)
+
+async def safe_generate(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> Optional[Any]:
+    """Génère du contenu avec gestion du quota 429 - Fallback: Gemini → Kimi → Ollama"""
+    
+    # 1. Try Gemini (Primary)
+    if client and GEMINI_API_KEY:
         try:
-            # On utilise le client Ollama pointant vers le conteneur ollama
-            async with httpx.AsyncClient(timeout=120.0) as http_client:
-               payload = {
-                   "model": OLLAMA_MODEL,
-                   "prompt": prompt,
-                   "stream": False
-               }
-               res = await http_client.post(f"{OLLAMA_HOST}/api/generate", json=payload)
-               res.raise_for_status()
-               data = res.json()
+            response = client.models.generate_content(model=MODEL_ID, contents=prompt)
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            logger.warning(f"⚠️ Gemini indisponible ({e}). Bascule sur Kimi K2.5...")
+    
+    # 2. Fallback to Kimi K2.5
+    if KIMI_API_KEY:
+        try:
+            kimi_response = await query_kimi(prompt)
+            if kimi_response:
+                await context.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text="🌙 *Note : Gemini est hors ligne, réponse générée par Kimi K2.5.*",
+                    parse_mode='Markdown'
+                )
+                return kimi_response
+        except Exception as e:
+            logger.warning(f"⚠️ Kimi indisponible ({e}). Bascule sur Ollama local...")
+    
+    # 3. Fallback to Ollama (Local)
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as http_client:
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False
+            }
+            res = await http_client.post(f"{OLLAMA_HOST}/api/generate", json=payload)
+            res.raise_for_status()
+            data = res.json()
             
-               # On ajoute une petite notification pour savoir qu'on est en mode dégradé
-               await context.bot.send_message(
-                   chat_id=AUTHORIZED_USER_ID,
-                   text="🏠 *Note : Gemini est hors ligne, réponse générée localement par Ollama.*",
-                   parse_mode='Markdown'
-               )
-               return data.get('response')
-        except Exception as ollama_err:
-            logger.error(f"❌ Échec critique : Gemini ET Ollama sont HS. {ollama_err}")
             await context.bot.send_message(
                 chat_id=AUTHORIZED_USER_ID,
-                text="❌ Échec critique : Gemini ET Ollama sont HS.",
+                text="🏠 *Note : Services cloud hors ligne, réponse générée localement par Ollama.*",
                 parse_mode='Markdown'
             )
-            return None   
-    return None
+            return data.get('response')
+    except Exception as ollama_err:
+        logger.error(f"❌ Échec critique : Tous les services AI sont HS. {ollama_err}")
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text="❌ Échec critique : Gemini, Kimi ET Ollama sont HS.",
+            parse_mode='Markdown'
+        )
+        return None
 
 
 # --- EXECUTEUR DE TÂCHES ---
@@ -527,12 +1057,12 @@ Retourne UNIQUEMENT un JSON avec cette structure:
             logs = await self._read_recent_logs(lines=100)
             metrics = await self._get_task_metrics()
             
-            # Step 2: Query Gemini for analysis (NEVER use Ollama for self-update)
-            await self._notify_progress(task, context, "🤖 Analyzing with Gemini...")
-            analysis = await self._query_gemini_self_analysis(code, logs, metrics)
+            # Step 2: Query AI for analysis (Gemini → Kimi, NEVER use Ollama for self-update)
+            await self._notify_progress(task, context, "🤖 Analyzing with AI...")
+            analysis = await self._query_self_analysis(code, logs, metrics)
             
             if not analysis:
-                return "❌ Failed to get analysis from Gemini"
+                return "❌ Failed to get analysis from AI services (Gemini/Kimi)"
             
             # Step 3: Parse metrics
             confidence = analysis.get('code_confidence', 0)
@@ -650,8 +1180,8 @@ Summary: {analysis.get('summary', 'No summary provided')}"""
             logger.error(f"Failed to get task metrics: {e}")
             return {'error': str(e)}
     
-    async def _query_gemini_self_analysis(self, code: str, logs: str, metrics: Dict) -> Optional[Dict]:
-        """Query Gemini for self-analysis (NEVER use Ollama for this)"""
+    async def _query_self_analysis(self, code: str, logs: str, metrics: Dict) -> Optional[Dict]:
+        """Query AI for self-analysis - Gemini primary, Kimi fallback (NEVER use Ollama for this)"""
         prompt = f"""Analyze the following autonomous agent code and provide improvement suggestions.
 
 Current Code:
@@ -697,14 +1227,34 @@ Return ONLY a valid JSON object with this exact structure:
     ]
 }}"""
         
+        response_text = None
+        
+        # Try Gemini first
+        if client and GEMINI_API_KEY:
+            try:
+                response = client.models.generate_content(model=MODEL_ID, contents=prompt)
+                if response and response.text:
+                    response_text = response.text
+                    logger.info("Self-analysis: Using Gemini")
+            except Exception as e:
+                logger.warning(f"⚠️ Gemini unavailable for self-analysis ({e})")
+        
+        # Fallback to Kimi if Gemini failed
+        if not response_text and KIMI_API_KEY:
+            try:
+                response_text = await query_kimi(prompt)
+                if response_text:
+                    logger.info("Self-analysis: Using Kimi K2.5")
+            except Exception as e:
+                logger.warning(f"⚠️ Kimi unavailable for self-analysis ({e})")
+        
+        if not response_text:
+            logger.error("❌ Failed to get self-analysis from Gemini or Kimi")
+            return None
+        
+        # Parse JSON from response
         try:
-            # Only use Gemini, never fallback to Ollama for self-update
-            response = client.models.generate_content(model=MODEL_ID, contents=prompt)
-            if not response or not response.text:
-                return None
-            
-            # Parse JSON from response
-            text = response.text.strip()
+            text = response_text.strip()
             # Handle markdown code blocks
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0]
@@ -713,7 +1263,7 @@ Return ONLY a valid JSON object with this exact structure:
             
             return json.loads(text)
         except Exception as e:
-            logger.error(f"Failed to query Gemini for self-analysis: {e}")
+            logger.error(f"Failed to parse self-analysis response: {e}")
             return None
     
     async def _apply_self_update_changes(self, analysis: Dict, task: Task, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -1450,6 +2000,8 @@ async def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("revert", cmd_revert))
+    app.add_handler(CommandHandler("ignore", cmd_ignore_verification))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_error_handler(error_handler)
 
@@ -1477,6 +2029,16 @@ async def main():
         logger.info("✅ Agent Pulling. En attente de messages...")
 
         await app.bot.send_message(chat_id=AUTHORIZED_USER_ID, text="PONG 🏓 (Bot Online)")
+        
+        # Perform startup verification after update
+        # Create a minimal context for startup verification
+        from telegram.ext import CallbackContext
+        startup_context = CallbackContext(app)
+        startup_context._bot = app.bot
+        startup_context._chat_id = int(AUTHORIZED_USER_ID) if AUTHORIZED_USER_ID else None
+        startup_context.bot_data = app.bot_data
+        await perform_startup_verification(startup_context)
+        
         stop_event = asyncio.Event()
         await stop_event.wait()
             

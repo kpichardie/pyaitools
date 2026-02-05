@@ -18,6 +18,7 @@ autonomous/
 - **Language**: Python 3.11+
 - **AI Models**: 
   - Primary: Google Gemini (Gemini 2.0 Flash)
+  - Secondary: Moonshot AI (Kimi K2.5)
   - Fallback: Local Ollama (Llama3 via HTTP API)
 - **Database**: SQLite (persistent task storage)
 - **Communication**: Telegram Bot API
@@ -32,6 +33,12 @@ GEMINI_API_KEY=<google_api_key>
 AUTHORIZED_USER_ID=<telegram_user_id>
 ```
 
+#### Optional AI Models
+```bash
+KIMI_API_KEY=<moonshot_api_key>      # For Kimi K2.5 model
+KIMI_MODEL=kimi-k2.5                   # Kimi model ID
+```
+
 #### Optional (with defaults)
 ```bash
 DB_FILE=/app/tasks.db                    # SQLite database path
@@ -43,6 +50,11 @@ MAX_RETRIES=3                            # Max retry attempts per task
 OLLAMA_HOST=http://localhost:11434       # Ollama API endpoint
 OLLAMA_MODEL=llama3                      # Local model name
 FORCED_AI_REPORT=false                   # Force Gemini for reports
+
+# Kimi K2.5 Configuration
+KIMI_API_KEY=<moonshot_api_key>          # Moonshot AI API key
+KIMI_BASE_URL=https://api.moonshot.cn/v1 # Kimi API base URL
+KIMI_MODEL=kimi-k2.5                     # Kimi model ID
 ```
 
 ## Task System
@@ -89,6 +101,8 @@ PENDING → RUNNING → [COMPLETED | FAILED | RETRYING]
 - **/selfupdate [force]**: Trigger manual self-improvement analysis
   - Without args: Runs analysis and asks for confirmation if metrics < 50%
   - With `force`: Applies changes immediately (use with caution)
+- **/revert**: Revert to previous commit (available after failed update)
+- **/ignore**: Ignore startup verification issues and continue
 - **Text messages**: Interpreted by AI to create and execute tasks
 
 ### Message Types
@@ -108,6 +122,62 @@ The agent sends Telegram notifications for:
 - Retry scheduling
 - Hourly reports (every 3 hours)
 - Self-improvement proposals
+- Startup verification results (after updates)
+
+## Startup Verification System
+
+### Overview
+After a self-update is applied and the agent restarts, the system automatically performs verification to detect any issues caused by the update.
+
+### Verification Process
+```
+Agent starts
+↓
+Check current git commit vs stored last commit
+↓
+IF commit changed:
+  ↓
+  Check logs for errors/warnings since last start
+  ↓
+  IF issues found:
+    ↓
+    Query AI (Gemini/Kimi) to analyze issues
+    ↓
+    Classify severity: critical/high/medium/low
+    ↓
+    Recommend action: revert/self_update/monitor
+    ↓
+    Notify user with options
+  ELSE:
+    ↓
+    Notify: "✅ Startup Check Passed"
+ELSE:
+  ↓
+  Normal startup (no update detected)
+```
+
+### User Actions After Failed Update
+When issues are detected after an update, the user receives:
+- Severity assessment (🔴 critical, 🟠 high, 🟡 medium, 🟢 low)
+- AI analysis summary and likely cause
+- Recommended action
+
+**Available Commands:**
+- **/revert** - Revert to the previous commit and restart
+- **/ignore** - Mark current commit as verified and continue
+- **/selfupdate** - Trigger a new self-update to fix issues
+
+### Commit Tracking
+The agent stores the last verified commit in `/app/.last_commit`:
+- Created after successful verification
+- Updated when /ignore is used
+- Used on next startup to detect updates
+
+### Safety Features
+- Automatic backup created before revert
+- Git history preserved
+- Agent restarts after revert to apply changes
+- Verification state cleared after action taken
 
 ## Self-Improvement System (Planned)
 
@@ -131,7 +201,7 @@ Agent acknowledges: "🔍 Starting self-analysis..."
 ↓
 Collect data (code, logs, tasks)
 ↓
-Query Gemini for evaluation
+Query AI (Gemini/Kimi) for evaluation
 ↓
 Display metrics in Telegram:
   📊 Self-Analysis Results:
@@ -157,8 +227,8 @@ If ANY metric < 50%:
    - Log analysis: Parse recent LOG_FILE entries
    - Task analysis: Query completed/failed tasks from SQLite
 
-2. **AI Evaluation** (Using Gemini only - no local models)
-   The agent queries Gemini with structured context:
+2. **AI Evaluation** (Using Gemini → Kimi - no local models)
+    The agent queries AI services with structured context:
    ```
    Context:
    - Current code: <full_source_code>
@@ -209,7 +279,7 @@ If ANY metric < 50%:
 
 ### Safety Constraints
 - **NEVER** use local Ollama models for self-improvement decisions
-- **ALWAYS** validate proposed changes with Gemini (cloud API)
+- **ALWAYS** validate proposed changes with cloud AI APIs (Gemini/Kimi)
 - **REQUIRE** explicit user approval for low-confidence changes (< 50%)
 - **CREATE** git backups before applying changes
 - **TEST** changes in isolated environment when possible
@@ -274,7 +344,7 @@ async def _execute_self_update(self, task: Task, context: ContextTypes.DEFAULT_T
     
     # Step 2: Query Gemini for analysis (NEVER use Ollama)
     await self._notify_progress(task, context, "🤖 Analyzing with Gemini...")
-    analysis = await self._query_gemini_self_analysis(code, logs, metrics)
+    analysis = await self._query_self_analysis(code, logs, metrics)
     
     # Step 3: Parse metrics
     confidence = analysis.get('code_confidence', 0)
@@ -399,6 +469,11 @@ pending_confirmations[user_id] = {
 7. Start background jobs
 8. Begin polling for messages
 9. Send "Bot Online" notification
+10. Perform startup verification (if update detected)
+    - Compare current commit with stored last commit
+    - Check logs for errors/warnings
+    - Query AI if issues found
+    - Notify user with recommendations
 ```
 
 ### Background Jobs
@@ -416,11 +491,11 @@ pending_confirmations[user_id] = {
    - Notify users of expired confirmations
 
 4. **daily_self_analysis**: Every 24 hours (86400 seconds)
-   - Trigger automatic self-improvement analysis
-   - Collect code, logs, and metrics
-   - Query Gemini for evaluation
-   - Apply changes if ALL metrics ≥ 50%
-   - Request user approval if ANY metric < 50%
+    - Trigger automatic self-improvement analysis
+    - Collect code, logs, and metrics
+    - Query AI (Gemini/Kimi) for evaluation
+    - Apply changes if ALL metrics ≥ 50%
+    - Request user approval if ANY metric < 50%
 
 5. **hourly_report**: Every 3 hours (10800 seconds)
    - Summarize recent actions
@@ -436,9 +511,9 @@ pending_confirmations[user_id] = {
    - FILE_EDIT: backup + write
    - AI_ANALYSIS: call safe_generate()
    - PLAN: create subtasks
-   - SELF_UPDATE: Run self-analysis workflow (Gemini only)
-     * Collect code, logs, metrics
-     * Query Gemini for evaluation
+    - SELF_UPDATE: Run self-analysis workflow (AI only - no local models)
+      * Collect code, logs, metrics
+      * Query AI (Gemini/Kimi) for evaluation
      * Display metrics to user
      * Await confirmation (or auto-apply if metrics ≥ 50%)
      * Apply changes, git commit, restart
@@ -451,7 +526,7 @@ pending_confirmations[user_id] = {
 
 ### AI Fallback Chain
 ```
-Gemini API → [if 429 or error] → Ollama Local
+Gemini API → [if 429 or error] → Kimi K2.5 → [if error] → Ollama Local
 ```
 
 ### Retry Mechanism
@@ -523,6 +598,7 @@ CMD ["python", "autonomous_orchestrator.py"]
 ├── autonomous_orchestrator.py  # Main code
 ├── tasks.db                    # SQLite database (volume)
 ├── autonomous.log              # Log file (volume)
+├── .last_commit                # Stores last verified commit hash
 └── backups/                    # Code backups (volume)
 ```
 
@@ -603,6 +679,7 @@ httpx>=0.24.0
 ### External Services
 - Telegram Bot API
 - Google Gemini API
+- Moonshot AI API (Kimi K2.5)
 - Ollama (optional, local)
 
 ## Notes
