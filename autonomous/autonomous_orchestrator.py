@@ -13,6 +13,7 @@ import os
 import sys
 import sqlite3
 import threading
+import telegram
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from enum import Enum
@@ -270,7 +271,7 @@ async def safe_generate(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> Opti
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            return client.models.generate_content(model=MODEL_ID, contents=prompt)
+            return client.models.generate_content(model=MODEL_ID, contents=prompt).text
         except Exception as e:
             logger.warning(f"⚠️ Gemini indisponible ({e}). Bascule sur Ollama local...")
 
@@ -336,6 +337,11 @@ class TaskExecutor:
                 result = await self._create_plan(task, context)
             else:
                 result = "Type de tâche inconnu"
+                await context.bot.send_message(
+                    chat_id=task.user_id,
+                    text=f"**Tâche Unknown**\n{task.description}\n\n⚠️ ",
+                    parse_mode='Markdown'
+                )
 
             task.status = TaskStatus.COMPLETED
             task.result = result
@@ -360,6 +366,11 @@ class TaskExecutor:
                 task.status = TaskStatus.RETRYING
                 task.scheduled_at = datetime.now() + timedelta(minutes=RETRY_DELAY_MINUTES)
                 logger.info(f"[Task {task.id}] Retry prévu dans {RETRY_DELAY_MINUTES}min ({task.retry_count}/{task.max_retries})")
+                await context.bot.send_message(
+                    chat_id=task.user_id,
+                    text=f"❌ **Tâche #{task.id} retry planned **\n{task.description}\n\n⚠️ Erreur: {str(e)}",
+                    parse_mode='Markdown'
+                )
             else:
                 task.status = TaskStatus.FAILED
                 logger.error(f"[Task {task.id}] Échec définitif après {task.max_retries} tentatives")
@@ -524,7 +535,7 @@ Exemples:
 - "lance un ping google" -> COMMAND: ping -c 3 google.com
 - "lis le fichier X" -> READ_FILE: /path/to/file
 - "crée un plan pour X" -> PLAN: déployer une app web
-- "Quel est l'etat du job 1" DB_QUERY: serveur
+- "Quel est l'etat du job 1" DB_QUERY: 
 """
 
     try:
@@ -533,7 +544,7 @@ Exemples:
             await temp_msg.edit_text("❌ Quota épuisé")
             return
 
-        res_text = response.text.strip()
+        res_text = response.strip()
         logger.info(f"Décision AI: {res_text[:100]}")
 
     except Exception as e:
@@ -545,138 +556,156 @@ Exemples:
     db = context.bot_data['db']
     executor = context.bot_data['executor']
 
-    if res_text.startswith("COMMAND:"):
-        cmd = res_text.replace("COMMAND:", "").strip()
-        task = Task(
-            id=None,
-            user_id=update.effective_user.id,
-            description=user_text,
-            task_type=TaskType.COMMAND,
-            parameters={'command': cmd},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            retry_count=0,
-            max_retries=MAX_RETRIES,
-            parent_task_id=None,
-            error_message=None,
-            result=None,
-            scheduled_at=None
-        )
-        task.id = db.create_task(task)
-        await temp_msg.edit_text(f"⚙️ Tâche #{task.id} créée: `{cmd}`", parse_mode='Markdown')
-        # Exécution immédiate
-        await executor.execute_task(task, context)
+    try:
+       if res_text.startswith("COMMAND:"):
+           logger.info("Start COMMAND")
+           cmd = res_text.replace("COMMAND:", "").strip()
+           task = Task(
+               id=None,
+               user_id=update.effective_user.id,
+               description=user_text,
+               task_type=TaskType.COMMAND,
+               parameters={'command': cmd},
+               status=TaskStatus.PENDING,
+               created_at=datetime.now(),
+               updated_at=datetime.now(),
+               retry_count=0,
+               max_retries=MAX_RETRIES,
+               parent_task_id=None,
+               error_message=None,
+               result=None,
+               scheduled_at=None
+           )
+           task.id = db.create_task(task)
+           await temp_msg.edit_text(f"⚙️ Tâche #{task.id} créée: `{cmd}`", parse_mode='Markdown')
+           # Exécution immédiate
+           await executor.execute_task(task, context)
 
-    elif res_text.startswith("READ_FILE:"):
-        path = res_text.replace("READ_FILE:", "").strip()
-        task = Task(
-            id=None,
-            user_id=update.effective_user.id,
-            description=user_text,
-            task_type=TaskType.FILE_READ,
-            parameters={'path': path},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            retry_count=0,
-            max_retries=MAX_RETRIES,
-            parent_task_id=None,
-            error_message=None,
-            result=None,
-            scheduled_at=None
-        )
-        task.id = db.create_task(task)
-        await temp_msg.edit_text(f"📖 Lecture de `{path}`...", parse_mode='Markdown')
-        await executor.execute_task(task, context)
+       elif res_text.startswith("READ_FILE:"):
+           logger.info("Start READ_FILE")
+           path = res_text.replace("READ_FILE:", "").strip()
+           task = Task(
+               id=None,
+               user_id=update.effective_user.id,
+               description=user_text,
+               task_type=TaskType.FILE_READ,
+               parameters={'path': path},
+               status=TaskStatus.PENDING,
+               created_at=datetime.now(),
+               updated_at=datetime.now(),
+               retry_count=0,
+               max_retries=MAX_RETRIES,
+               parent_task_id=None,
+               error_message=None,
+               result=None,
+               scheduled_at=None
+           )
+           task.id = db.create_task(task)
+           await temp_msg.edit_text(f"📖 Lecture de `{path}`...", parse_mode='Markdown')
+           await executor.execute_task(task, context)
 
-    elif res_text.startswith("EDIT_FILE:"):
-        parts = res_text.replace("EDIT_FILE:", "").split("|", 1)
-        if len(parts) == 2:
-            path, content = parts[0].strip(), parts[1].strip()
-            task = Task(
-                id=None,
-                user_id=update.effective_user.id,
-                description=user_text,
-                task_type=TaskType.FILE_EDIT,
-                parameters={'path': path, 'content': content},
-                status=TaskStatus.PENDING,
-                created_at=datetime.now(),
-                updated_at=datetime.now(),
-                retry_count=0,
-                max_retries=MAX_RETRIES,
-                parent_task_id=None,
-                error_message=None,
-                result=None,
-                scheduled_at=None
-            )
-            task.id = db.create_task(task)
-            await temp_msg.edit_text(f"✏️ Édition de `{path}`...", parse_mode='Markdown')
-            await executor.execute_task(task, context)
+       elif res_text.startswith("EDIT_FILE:"):
+           logger.info("Start EDIT_FILE")
+           parts = res_text.replace("EDIT_FILE:", "").split("|", 1)
+           if len(parts) == 2:
+               path, content = parts[0].strip(), parts[1].strip()
+               task = Task(
+                   id=None,
+                   user_id=update.effective_user.id,
+                   description=user_text,
+                   task_type=TaskType.FILE_EDIT,
+                   parameters={'path': path, 'content': content},
+                   status=TaskStatus.PENDING,
+                   created_at=datetime.now(),
+                   updated_at=datetime.now(),
+                   retry_count=0,
+                   max_retries=MAX_RETRIES,
+                   parent_task_id=None,
+                   error_message=None,
+                   result=None,
+                   scheduled_at=None
+               )
+               task.id = db.create_task(task)
+               await temp_msg.edit_text(f"✏️ Édition de `{path}`...", parse_mode='Markdown')
+               await executor.execute_task(task, context)
 
-    elif res_text.startswith("PLAN:"):
-        topic = res_text.replace("PLAN:", "").strip()
-        task = Task(
-            id=None,
-            user_id=update.effective_user.id,
-            description=user_text,
-            task_type=TaskType.PLAN,
-            parameters={'topic': topic},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            retry_count=0,
-            max_retries=MAX_RETRIES,
-            parent_task_id=None,
-            error_message=None,
-            result=None,
-            scheduled_at=None
-        )
-        task.id = db.create_task(task)
-        await temp_msg.edit_text(f"📋 Création du plan...", parse_mode='Markdown')
-        await executor.execute_task(task, context)
+       elif res_text.startswith("PLAN:"):
+           logger.info("Start PLAN")
+           topic = res_text.replace("PLAN:", "").strip()
+           task = Task(
+               id=None,
+               user_id=update.effective_user.id,
+               description=user_text,
+               task_type=TaskType.PLAN,
+               parameters={'topic': topic},
+               status=TaskStatus.PENDING,
+               created_at=datetime.now(),
+               updated_at=datetime.now(),
+               retry_count=0,
+               max_retries=MAX_RETRIES,
+               parent_task_id=None,
+               error_message=None,
+               result=None,
+               scheduled_at=None
+           )
+           task.id = db.create_task(task)
+           await temp_msg.edit_text(f"📋 Création du plan...", parse_mode='Markdown')
+           await executor.execute_task(task, context)
 
-    elif res_text.startswith("AI_ANALYSIS:"):
-        prompt = res_text.replace("AI_ANALYSIS:", "").strip()
-        task = Task(
-            id=None,
-            user_id=update.effective_user.id,
-            description=user_text,
-            task_type=TaskType.AI_ANALYSIS,
-            parameters={'prompt': prompt},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            retry_count=0,
-            max_retries=MAX_RETRIES,
-            parent_task_id=None,
-            error_message=None,
-            result=None,
-            scheduled_at=None
-        )
-        task.id = db.create_task(task)
-        await temp_msg.edit_text(f"🤖 Analyse en cours...", parse_mode='Markdown')
-        await executor.execute_task(task, context)
+       elif res_text.startswith("AI_ANALYSIS:"):
+           logger.info("Start AI_ANALYSIS")
+           prompt = res_text.replace("AI_ANALYSIS:", "").strip()
+           task = Task(
+               id=None,
+               user_id=update.effective_user.id,
+               description=user_text,
+               task_type=TaskType.AI_ANALYSIS,
+               parameters={'prompt': prompt},
+               status=TaskStatus.PENDING,
+               created_at=datetime.now(),
+               updated_at=datetime.now(),
+               retry_count=0,
+               max_retries=MAX_RETRIES,
+               parent_task_id=None,
+               error_message=None,
+               result=None,
+               scheduled_at=None
+           )
+           task.id = db.create_task(task)
+           await temp_msg.edit_text(f"🤖 Analyse en cours...", parse_mode='Markdown')
+           await executor.execute_task(task, context)
 
-    elif res_text.startswith("DB_QUERY:"):
-        query = res_text.replace("DB_QUERY:", "").strip()
-        tasks = db.search_tasks(query)
-        
-        if not tasks:
-            await temp_msg.edit_text(f"🔍 Aucune information trouvée pour `{query}`")
-            return
+       elif res_text.startswith("DB_QUERY:"):
+           logger.info("Start query DB")
+           query = res_text.replace("DB_QUERY:", "").strip()
+           tasks = db.search_tasks(query)
+           
+           if not tasks:
+               await temp_msg.edit_text(f"🔍 Aucune information trouvée pour `{query}`")
+               return
 
-        response_text = f"🔍 **Infos trouvées pour '{query}':**\n\n"
-        for t in tasks:
-            # On affiche un résumé court de chaque tâche trouvée
-            res_preview = (t.result[:100] + "...") if t.result else "Pas de résultat"
-            response_text += f"📌 **#{t.id}** ({t.updated_at.strftime('%d/%m')}): {t.description}\n└ Result: `{res_preview}`\n\n"
-        
-        await temp_msg.edit_text(response_text, parse_mode='Markdown') 
+           response_text = f"🔍 **Infos trouvées pour '{query}':**\n\n"
+           for t in tasks:
+               # On affiche un résumé court de chaque tâche trouvée
+               res_preview = (t.result[:100] + "...") if t.result else "Pas de résultat"
+               response_text += f"📌 **#{t.id}** ({t.updated_at.strftime('%d/%m')}): {t.description}\n└ Result: `{res_preview}`\n\n"
+           
+           await temp_msg.edit_text(response_text, parse_mode='Markdown') 
 
-    else:
-        # CHAT - réponse directe sans créer de tâche
-        await temp_msg.edit_text(res_text, parse_mode='Markdown')
+       else:
+           # CHAT - réponse directe sans créer de tâche
+           await temp_msg.edit_text(res_text, parse_mode='Markdown')
+    except telegram.error.BadRequest as e:
+        if "Can't parse entities" in str(e):
+          logger.warning("Formatage Markdown corrompu, envoi en texte brut.")
+          # Deuxième tentative : Texte pur (sans parse_mode)
+          try:
+            await update.message.reply_text(res_text)
+          except Exception as err:
+            logger.error(f"❌ Échec total cmd status : {err}")
+        else:
+          # Autre type d'erreur BadRequest
+          raise e
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -888,10 +917,10 @@ async def main():
         stop_event = asyncio.Event()
         await stop_event.wait()
             
-    #except telegram.error.Conflict:
-    #    logger.error("💥 Conflit détecté ! Une autre instance tourne déjà. Fermeture dans 10s...")
-    #    await asyncio.sleep(10)
-    #    return # Sortie propre
+    except telegram.error.Conflict:
+        logger.error("💥 Conflit détecté ! Une autre instance tourne déjà. Fermeture dans 10s...")
+        await asyncio.sleep(10)
+        return # Sortie propre
     except Exception as e:
       logger.error(f"💥 Erreur fatale au démarrage main : {e}")
 
